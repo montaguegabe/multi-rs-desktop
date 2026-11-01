@@ -13,10 +13,12 @@ import {
 } from 'lucide-react';
 import { useCollapsedPaths, worktreeDisplayName } from 'multi-react';
 import { errorMessage, repoService } from '../lib/bridge';
+import { folderName } from '../lib/paths';
+import { diffRoute } from '../lib/routes';
 import type { ProjectSummary, RepoStatus } from '../lib/types';
 import { summarizeBranches } from './branchSummary';
 import { getContextMenuActions } from './contextMenuActions';
-import { flattenProjectPaths, folderName, mergeProjectUpdates, sortProjects } from './projectListModel';
+import { flattenProjectPaths, mergeProjectUpdates, sortProjects } from './projectListModel';
 
 const STATUS_CONFIG: Record<RepoStatus, { color: string; label: string; dot: string }> = {
   clean: { color: 'text-green-500', label: 'Clean', dot: 'bg-green-500' },
@@ -61,7 +63,8 @@ export default function RepoList() {
       const updates = await repoService.getProjectStatuses(repoPaths);
       setRepos((current) => mergeProjectUpdates(current, updates));
     } catch (err) {
-      console.warn('Failed to refresh project statuses', err);
+      // The cached list stays on screen; the banner explains why it is stale.
+      setError(errorMessage(err));
     }
   }, []);
 
@@ -184,11 +187,7 @@ export default function RepoList() {
           <button
             type="button"
             disabled={!isClickable}
-            onClick={() =>
-              navigate(
-                `/diff?path=${encodeURIComponent(repo.path)}&name=${encodeURIComponent(displayName)}`,
-              )
-            }
+            onClick={() => navigate(diffRoute({ repoPath: repo.path, name: displayName }))}
             className={`flex items-center gap-3 flex-1 min-w-0 text-left ${!isClickable ? 'opacity-50' : ''}`}
           >
             <span className={`h-2.5 w-2.5 rounded-full shrink-0 ${config?.dot ?? 'bg-gray-400'}`} />

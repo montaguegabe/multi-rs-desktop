@@ -11,10 +11,15 @@ use multi_core::git::{git_output_timeout, run_git_with_input, stderr_string, std
 use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 
+use crate::paths::basename;
 use crate::tasks::blocking;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Commits run the repository's hooks (linters, test suites), which can take
+/// far longer than a plain git command; killing them mid-run would leave a
+/// half-written index or hook caches behind.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A failed git invocation with everything the user may need to see.
 #[derive(Debug)]
@@ -44,12 +49,6 @@ impl GitFailure {
     fn lower(&self) -> String {
         self.text().to_lowercase()
     }
-}
-
-fn basename(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn git(cwd: &Path, args: &[&str], timeout: Duration) -> Result<Output, GitFailure> {
@@ -132,37 +131,37 @@ fn apply_patch(cwd: &Path, args: &[&str], patch: &str) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
-/// Stage a partial patch: reset the index, then `git apply --cached`.
+/// Make the index match exactly the user's selection: reset whatever was
+/// staged before (from a terminal or an earlier failed attempt), then
+/// `git apply --cached` the partially selected hunks and `git add` the fully
+/// selected files.
 #[tauri::command]
-pub async fn stage_changes(repo_path: String, patch: String) -> Result<(), String> {
+pub async fn stage_selection(
+    repo_path: String,
+    patch: Option<String>,
+    file_paths: Vec<String>,
+) -> Result<(), String> {
     blocking(move || {
         let cwd = PathBuf::from(&repo_path);
-        if let Err(failure) = git(&cwd, &["reset", "HEAD"], DEFAULT_TIMEOUT) {
+        if let Err(failure) = git(&cwd, &["reset", "-q", "HEAD"], DEFAULT_TIMEOUT) {
             log::warn!(
                 "git reset HEAD failed for {repo_path} (may be initial commit): {}",
                 failure.text()
             );
         }
-        apply_patch(
-            &cwd,
-            &["apply", "--cached", "--unidiff-zero", "--whitespace=nowarn"],
-            &patch,
-        )
-    })
-    .await?
-}
-
-/// `git add -- <paths>` for fully selected files.
-#[tauri::command]
-pub async fn stage_files(repo_path: String, file_paths: Vec<String>) -> Result<(), String> {
-    if file_paths.is_empty() {
-        return Ok(());
-    }
-    blocking(move || {
-        let cwd = PathBuf::from(&repo_path);
-        let mut args: Vec<&str> = vec!["add", "--"];
-        args.extend(file_paths.iter().map(String::as_str));
-        plain_git(&cwd, &args, DEFAULT_TIMEOUT).map(|_| ())
+        if let Some(patch) = patch.filter(|p| !p.trim().is_empty()) {
+            apply_patch(
+                &cwd,
+                &["apply", "--cached", "--unidiff-zero", "--whitespace=nowarn"],
+                &patch,
+            )?;
+        }
+        if !file_paths.is_empty() {
+            let mut args: Vec<&str> = vec!["add", "--"];
+            args.extend(file_paths.iter().map(String::as_str));
+            plain_git(&cwd, &args, DEFAULT_TIMEOUT)?;
+        }
+        Ok(())
     })
     .await?
 }
@@ -171,7 +170,7 @@ pub async fn stage_files(repo_path: String, file_paths: Vec<String>) -> Result<(
 pub async fn commit(repo_path: String, message: String) -> Result<(), String> {
     blocking(move || {
         let cwd = PathBuf::from(&repo_path);
-        plain_git(&cwd, &["commit", "-m", &message], DEFAULT_TIMEOUT).map(|_| ())
+        plain_git(&cwd, &["commit", "-m", &message], COMMIT_TIMEOUT).map(|_| ())
     })
     .await?
 }
@@ -283,7 +282,9 @@ pub async fn create_private_repo_and_push(repo_path: String) -> Result<(), Strin
     .await?
 }
 
-/// Discard a whole file: delete untracked files, `git checkout --` tracked ones.
+/// Discard a whole file, including anything staged for it: a new file is
+/// dropped from the index and deleted, a tracked file is restored from HEAD
+/// in both the index and the working tree.
 #[tauri::command]
 pub async fn discard_file(
     repo_path: String,
@@ -293,9 +294,19 @@ pub async fn discard_file(
     blocking(move || {
         let cwd = PathBuf::from(&repo_path);
         if is_new {
+            plain_git(
+                &cwd,
+                &["rm", "-q", "--cached", "--ignore-unmatch", "--", &file_path],
+                DEFAULT_TIMEOUT,
+            )?;
             std::fs::remove_file(cwd.join(&file_path)).map_err(|e| format!("{file_path}: {e}"))
         } else {
-            plain_git(&cwd, &["checkout", "--", &file_path], DEFAULT_TIMEOUT).map(|_| ())
+            plain_git(
+                &cwd,
+                &["checkout", "HEAD", "--", &file_path],
+                DEFAULT_TIMEOUT,
+            )
+            .map(|_| ())
         }
     })
     .await?

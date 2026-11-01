@@ -2,9 +2,13 @@
 //!
 //! Context menus pop up natively and resolve to the clicked item id (or
 //! `None` when dismissed), matching the renderer's `showNativeContextMenu`
-//! contract.
+//! contract. On macOS and Windows `popup_menu` blocks until the menu closes,
+//! so its return doubles as the dismissal signal. GTK returns immediately, so
+//! on Linux a menu resolves only through a click, through being replaced by
+//! the next menu, or through the overall timeout.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
@@ -17,6 +21,11 @@ use crate::window::show_main_window;
 
 pub const SETTINGS_MENU_ID: &str = "settings";
 const CONTEXT_PREFIX: &str = "ctx:";
+/// Upper bound on how long a popup may stay open without resolving.
+const CONTEXT_MENU_TIMEOUT: Duration = Duration::from_secs(120);
+/// The click event is delivered through the runtime's event loop and may land
+/// slightly after a blocking popup returns.
+const CLICK_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,13 +43,19 @@ enum ContextMenuMessage {
 }
 
 struct PendingContextMenu {
+    /// Distinguishes this popup from one that replaced it.
+    generation: u64,
     ids: Vec<Option<String>>,
     sender: Sender<ContextMenuMessage>,
 }
 
-/// The context menu currently shown, if any.
+/// The context menu currently shown, if any, plus a counter for telling
+/// successive popups apart.
 #[derive(Default)]
-pub struct ContextMenuState(Mutex<Option<PendingContextMenu>>);
+pub struct ContextMenuState {
+    pending: Mutex<Option<PendingContextMenu>>,
+    generations: AtomicU64,
+}
 
 pub fn build_app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let settings = MenuItem::with_id(
@@ -111,7 +126,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
             return;
         };
         let state = app.state::<ContextMenuState>();
-        let pending = state.0.lock().ok().and_then(|mut guard| guard.take());
+        let pending = state.pending.lock().ok().and_then(|mut guard| guard.take());
         if let Some(pending) = pending {
             let selected = pending.ids.get(index).cloned().flatten();
             let _ = pending.sender.send(ContextMenuMessage::Selected(selected));
@@ -154,43 +169,49 @@ pub async fn show_context_menu(
     let menu = builder.build().map_err(|e| e.to_string())?;
 
     let (sender, receiver) = channel();
-    {
+    let generation = {
         let state = app.state::<ContextMenuState>();
-        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
-        *guard = Some(PendingContextMenu {
+        let generation = state.generations.fetch_add(1, Ordering::Relaxed);
+        let mut guard = state.pending.lock().map_err(|e| e.to_string())?;
+        if let Some(previous) = guard.replace(PendingContextMenu {
+            generation,
             ids,
             sender: sender.clone(),
-        });
-    }
+        }) {
+            let _ = previous.sender.send(ContextMenuMessage::Closed);
+        }
+        generation
+    };
 
     let popup_window = window.clone();
     app.run_on_main_thread(move || {
         if let Err(err) = popup_window.popup_menu(&menu) {
             log::warn!("context menu popup failed: {err}");
+            let _ = sender.send(ContextMenuMessage::Closed);
+            return;
         }
-        let _ = sender.send(ContextMenuMessage::Closed);
+        if cfg!(not(target_os = "linux")) {
+            let _ = sender.send(ContextMenuMessage::Closed);
+        }
     })
     .map_err(|e| e.to_string())?;
 
-    let selection = blocking(move || {
-        let overall = Duration::from_secs(120);
-        match receiver.recv_timeout(overall) {
+    let selection = blocking(move || match receiver.recv_timeout(CONTEXT_MENU_TIMEOUT) {
+        Ok(ContextMenuMessage::Selected(id)) => id,
+        Ok(ContextMenuMessage::Closed) => match receiver.recv_timeout(CLICK_GRACE) {
             Ok(ContextMenuMessage::Selected(id)) => id,
-            Ok(ContextMenuMessage::Closed) => {
-                // The click event may arrive just after the popup returns.
-                match receiver.recv_timeout(Duration::from_millis(250)) {
-                    Ok(ContextMenuMessage::Selected(id)) => id,
-                    Ok(ContextMenuMessage::Closed) | Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => None,
-                }
-            }
-            Err(_) => None,
-        }
+            Ok(ContextMenuMessage::Closed) | Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => None,
+        },
+        Err(_) => None,
     })
     .await?;
 
+    // Clear our entry unless a newer popup already replaced it.
     let state = app.state::<ContextMenuState>();
-    if let Ok(mut guard) = state.0.lock() {
+    if let Ok(mut guard) = state.pending.lock()
+        && guard.as_ref().is_some_and(|p| p.generation == generation)
+    {
         guard.take();
     }
     Ok(selection)

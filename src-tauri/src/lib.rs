@@ -5,6 +5,7 @@ mod deep_link;
 mod git_ops;
 mod menu;
 mod openai;
+mod paths;
 mod projects;
 mod store;
 mod tasks;
@@ -58,8 +59,7 @@ pub fn run() {
             store::remove_repo,
             store::get_open_ai_api_key,
             store::set_open_ai_api_key,
-            git_ops::stage_changes,
-            git_ops::stage_files,
+            git_ops::stage_selection,
             git_ops::commit,
             git_ops::push,
             git_ops::create_private_repo_and_push,

@@ -31,14 +31,21 @@ pub fn target_from_url(url: &str) -> Option<NavigationTarget> {
     resolve_navigation_target(&PathBuf::from(path.as_ref()))
 }
 
-/// Navigate the renderer to a repository, remembering the request until the
-/// renderer asks for it when the window is still loading.
+/// Navigate the renderer to a repository. The target is also parked in
+/// `PendingNavigation` because the emitted event is lost when the window is
+/// still loading (cold start, or a window recreated from the dock); the
+/// renderer takes the pending target when it mounts and clears it whenever it
+/// handles the event, so a delivered navigation never replays on a later mount.
 pub fn navigate_to_repo<R: Runtime>(app: &AppHandle<R>, target: NavigationTarget) {
-    if let Ok(mut pending) = app.state::<PendingNavigation>().0.lock() {
-        *pending = Some(target.clone());
-    }
+    set_pending_navigation(app, Some(target.clone()));
     if let Some(window) = show_main_window(app) {
         let _ = window.emit("navigate-to-repo", &target);
+    }
+}
+
+fn set_pending_navigation<R: Runtime>(app: &AppHandle<R>, target: Option<NavigationTarget>) {
+    if let Ok(mut pending) = app.state::<PendingNavigation>().0.lock() {
+        *pending = target;
     }
 }
 
@@ -52,7 +59,9 @@ pub fn handle_urls<R: Runtime>(app: &AppHandle<R>, urls: &[Url]) {
     }
 }
 
-/// Renderer handshake: the navigation requested before it was listening.
+/// Renderer handshake: the navigation requested before it was listening. The
+/// renderer also calls this after handling a live `navigate-to-repo` event so
+/// the target cannot replay when the window is recreated later.
 #[tauri::command]
 pub fn take_pending_navigation(app: AppHandle) -> Option<NavigationTarget> {
     app.state::<PendingNavigation>()

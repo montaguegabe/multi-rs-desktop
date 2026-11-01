@@ -29,7 +29,3 @@ export function mergeProjectUpdates(
 export function flattenProjectPaths(projects: ProjectSummary[]): string[] {
   return flattenWorktreePaths(projects);
 }
-
-export function folderName(projectPath: string): string {
-  return projectPath.split('/').pop() || projectPath;
-}

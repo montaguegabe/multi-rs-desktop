@@ -2,6 +2,7 @@
 //! project list with nested worktrees, fresh statuses, project detail and
 //! history group diffs.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -13,15 +14,9 @@ use multi_core::worktree::list_linked_worktree_paths;
 use multi_core::{Paths, load_repos};
 use serde::Serialize;
 
+use crate::paths::basename;
 use crate::store::read_project_paths;
 use crate::tasks::blocking;
-
-fn basename(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string())
-}
 
 /// Hide sub-repos pinned to a `fixedBranch` from a project's branch summary:
 /// they are expected to differ from the workspace branch.
@@ -88,7 +83,7 @@ fn build_project_summary_tree(
             .flatten()
             .filter_map(|worktree| summaries.get(worktree).cloned())
             .collect();
-        worktrees.sort_by_key(|w| basename(&w.path));
+        worktrees.sort_by_key(|w| basename(Path::new(&w.path)));
         summary.worktrees = if worktrees.is_empty() {
             None
         } else {
@@ -99,21 +94,51 @@ fn build_project_summary_tree(
     tree
 }
 
+/// Configured paths deduplicated by resolved identity, plus each project's
+/// linked worktrees under the spelling the rest of the pipeline keys on: the
+/// configured spelling when the worktree is itself a configured project,
+/// otherwise its resolved path. `git worktree list` reports resolved paths
+/// while `projects.json` holds whatever the user picked, so comparing raw
+/// strings would show a symlinked worktree both nested and at the top level.
+fn project_identities(
+    configured: &[String],
+    resolve: impl Fn(&str) -> String,
+    worktrees_of: impl Fn(&str) -> Vec<String>,
+) -> (Vec<String>, BTreeMap<String, Vec<String>>) {
+    let mut configured_by_resolved: BTreeMap<String, String> = BTreeMap::new();
+    let mut unique: Vec<String> = Vec::new();
+    for project in configured {
+        if let Entry::Vacant(slot) = configured_by_resolved.entry(resolve(project)) {
+            slot.insert(project.clone());
+            unique.push(project.clone());
+        }
+    }
+    let worktrees_by_project = unique
+        .iter()
+        .map(|project| {
+            let worktrees = worktrees_of(project)
+                .into_iter()
+                .map(|worktree| {
+                    let key = resolve(&worktree);
+                    configured_by_resolved.get(&key).cloned().unwrap_or(key)
+                })
+                .collect();
+            (project.clone(), worktrees)
+        })
+        .collect();
+    (unique, worktrees_by_project)
+}
+
 /// Configured projects (cached metadata where fresh) with linked worktrees
 /// nested under their trunk checkout.
 #[tauri::command]
 pub async fn get_projects_summary() -> Result<Vec<ProjectSummary>, String> {
     blocking(|| {
-        let configured = read_project_paths();
-        let worktrees_by_project: BTreeMap<String, Vec<String>> = configured
-            .iter()
-            .map(|project| {
-                (
-                    project.clone(),
-                    list_linked_worktree_paths(Path::new(project)),
-                )
-            })
-            .collect();
+        let (configured, worktrees_by_project) = project_identities(
+            &read_project_paths(),
+            |path| fsx::resolve(Path::new(path)).display().to_string(),
+            |path| list_linked_worktree_paths(Path::new(path)),
+        );
         let mut all_paths: Vec<String> = configured.clone();
         for worktrees in worktrees_by_project.values() {
             for worktree in worktrees {
@@ -192,7 +217,7 @@ mod tests {
     fn summary(path: &str) -> ProjectSummary {
         ProjectSummary {
             path: path.into(),
-            name: basename(path),
+            name: basename(Path::new(path)),
             last_modified_ms: None,
             last_commit_ms: None,
             status: RepoStatus::Unknown,
@@ -225,6 +250,33 @@ mod tests {
         let worktrees = tree[0].worktrees.as_ref().unwrap();
         assert_eq!(worktrees[0].path, "/p/trunk-worktrees/a");
         assert_eq!(worktrees[1].path, "/p/trunk-worktrees/b");
+    }
+
+    #[test]
+    fn identities_follow_resolved_paths_but_keep_configured_spelling() {
+        let resolve = |path: &str| path.replacen("/link/", "/real/", 1);
+        let worktrees_of = |path: &str| {
+            if resolve(path) == "/real/trunk" {
+                vec![
+                    "/real/trunk-worktrees/a".to_string(),
+                    "/real/trunk-worktrees/b".to_string(),
+                ]
+            } else {
+                vec![]
+            }
+        };
+        let configured = vec![
+            "/link/trunk".to_string(),
+            "/real/trunk".to_string(),
+            "/link/trunk-worktrees/a".to_string(),
+        ];
+        let (unique, by_project) = project_identities(&configured, resolve, worktrees_of);
+        assert_eq!(unique, vec!["/link/trunk", "/link/trunk-worktrees/a"]);
+        assert_eq!(
+            by_project["/link/trunk"],
+            vec!["/link/trunk-worktrees/a", "/real/trunk-worktrees/b"]
+        );
+        assert!(by_project["/link/trunk-worktrees/a"].is_empty());
     }
 
     #[test]

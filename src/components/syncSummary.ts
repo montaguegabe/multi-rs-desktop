@@ -1,13 +1,10 @@
+import { folderName } from '../lib/paths';
 import type { RepoSyncState } from '../lib/types';
 
 export type SyncSummary = {
   label: string;
   title: string;
 };
-
-function repoNameFromPath(repoPath: string): string {
-  return repoPath.split('/').pop() || repoPath;
-}
 
 export function summarizeSyncStates(
   syncStatesByRepoPath: Record<string, RepoSyncState>,
@@ -30,7 +27,7 @@ export function summarizeSyncStates(
       const details: string[] = [];
       if (state.ahead > 0) details.push(`${state.ahead} ahead`);
       if (state.behind > 0) details.push(`${state.behind} behind`);
-      return `${repoNameFromPath(repoPath)}: ${details.join(', ')}`;
+      return `${folderName(repoPath)}: ${details.join(', ')}`;
     })
     .join('\n');
 

@@ -7,7 +7,6 @@ import {
   DiffSelectionType,
   formatPatch,
   formatDiscardPatch,
-  parseDiff,
   LineType,
   buildRepoFileEntries,
   type ContextMenuAction,
@@ -18,6 +17,7 @@ import {
   type FileEntry,
 } from 'multi-react';
 import { alertDialog, confirmDialog, errorMessage, repoService } from '../lib/bridge';
+import { folderName } from '../lib/paths';
 import type { RepoBranch, RepoSyncState } from '../lib/types';
 import { summarizeBranches } from './branchSummary';
 import { summarizeSyncStates } from './syncSummary';
@@ -104,32 +104,35 @@ function describeUnpatchableSelection(entry: FileEntry): string {
   return `- ${entry.status}: ${entry.displayPath}`;
 }
 
-/** Move the deep-linked file's patch to the top of a repo diff. */
+/**
+ * Move the deep-linked file's patch to the top of a repo diff. The raw text is
+ * reordered by `diff --git` section so binary, mode-only and rename-only
+ * entries, which have no text hunks to re-serialize, are kept verbatim.
+ */
 function prioritizeTargetFile(diff: string, targetFilePath: string): string {
   const normalizedTarget = normalizeFilePathForCompare(targetFilePath);
   if (!normalizedTarget || !diff.trim()) return diff;
 
-  const files = parseDiff(diff);
-  if (files.length < 2) return diff;
-
-  const targetIndex = files.findIndex((file) => {
-    const displayPath = file.isDeleted
-      ? file.oldName.replace(/^[ab]\//, '')
-      : file.newName.replace(/^[ab]\//, '');
-    return normalizeFilePathForCompare(displayPath) === normalizedTarget;
+  const sections = diff.split(/(?=^diff --git )/m);
+  const targetIndex = sections.findIndex((section) => {
+    const header = section.split('\n', 1)[0];
+    if (!header.startsWith('diff --git ')) return false;
+    const names = header.slice('diff --git '.length);
+    // `a/<path> b/<path>` for most changes; renames end with ` b/<new path>`.
+    return (
+      names === `a/${normalizedTarget} b/${normalizedTarget}` ||
+      names.endsWith(` b/${normalizedTarget}`)
+    );
   });
-
   if (targetIndex <= 0) return diff;
 
-  const orderedFiles = [files[targetIndex], ...files.filter((_file, index) => index !== targetIndex)];
-  const allSelected = DiffSelection.fromInitialSelection(DiffSelectionType.All);
-
-  const rebuiltDiff = orderedFiles
-    .map((file) => formatPatch(file, allSelected, file.isNew === true))
-    .filter((patch): patch is string => Boolean(patch))
-    .join('');
-
-  return rebuiltDiff || diff;
+  // Keep any preamble before the first section in place.
+  const preambleCount = sections[0].startsWith('diff --git ') ? 0 : 1;
+  if (targetIndex < preambleCount) return diff;
+  const preamble = sections.slice(0, preambleCount);
+  const files = sections.slice(preambleCount);
+  const index = targetIndex - preambleCount;
+  return [...preamble, files[index], ...files.filter((_section, i) => i !== index)].join('');
 }
 
 type PushFailure = {
@@ -138,16 +141,12 @@ type PushFailure = {
   needsDestinationFix: boolean;
 };
 
-function repoDisplayName(repoPath: string): string {
-  return repoPath.split('/').pop() || repoPath;
-}
-
 export default function RepoDiff() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const repoPath = searchParams.get('path') ?? '';
   const targetFilePath = searchParams.get('file') ?? '';
-  const repoName = searchParams.get('name') ?? repoDisplayName(repoPath);
+  const repoName = searchParams.get('name') ?? folderName(repoPath);
 
   const [repositories, setRepositories] = useState<Repository[]>([]);
   const [loading, setLoading] = useState(true);
@@ -300,21 +299,23 @@ export default function RepoDiff() {
           const stageFilePaths = [...fullySelectedPaths];
           if (patchParts.length === 0 && stageFilePaths.length === 0) continue;
 
-          if (patchParts.length > 0) {
-            await repoService.stageChanges(rPath, patchParts.join(''));
-          }
-          if (stageFilePaths.length > 0) {
-            await repoService.stageFiles(rPath, stageFilePaths);
-          }
+          // One call resets the index first, so the commit contains exactly the
+          // selection even when something was staged outside the app.
+          await repoService.stageSelection(
+            rPath,
+            patchParts.length > 0 ? patchParts.join('') : null,
+            stageFilePaths,
+          );
           const message = messages[name];
           if (message) {
             await repoService.commit(rPath, message);
           }
         }
-
-        void fetchDiff();
       } finally {
         setCommitting(false);
+        // Refresh even after a failure part-way through: earlier repos may
+        // already have committed, and their hunks must leave the pending view.
+        void fetchDiff();
       }
     },
     [entries, selections, repoPathByName, fetchDiff],
@@ -423,7 +424,7 @@ export default function RepoDiff() {
 
       const destinationFailures = failures.filter((f) => f.needsDestinationFix);
       if (destinationFailures.length > 0) {
-        const names = destinationFailures.map(({ repoPath: p }) => repoDisplayName(p));
+        const names = destinationFailures.map(({ repoPath: p }) => folderName(p));
         const prompt = `Some repos have no push destination:\n${names.join('\n')}\n\nCreate a new private GitHub repo (if needed) and retry push?`;
         if (await confirmDialog(prompt)) {
           const retryResults = await Promise.all(
@@ -442,7 +443,7 @@ export default function RepoDiff() {
         const maxShown = 5;
         const shown = failures
           .slice(0, maxShown)
-          .map(({ repoPath: p, message }) => `${repoDisplayName(p)}: ${message}`);
+          .map(({ repoPath: p, message }) => `${folderName(p)}: ${message}`);
         const extra = failures.length > maxShown ? `\n...and ${failures.length - maxShown} more.` : '';
         await alertDialog(
           `Sync completed with errors (${repoPaths.length - failures.length}/${repoPaths.length} repos synced):\n${shown.join('\n')}${extra}`,
@@ -486,7 +487,7 @@ export default function RepoDiff() {
       await repoService.openInGitHubWeb(selectedRepoPath);
     } catch {
       await alertDialog(
-        `Unable to open GitHub web URL for ${repoDisplayName(selectedRepoPath)}. Ensure the origin remote points to GitHub.`,
+        `Unable to open GitHub web URL for ${folderName(selectedRepoPath)}. Ensure the origin remote points to GitHub.`,
       );
     }
   }, []);

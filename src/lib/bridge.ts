@@ -35,10 +35,9 @@ export const repoService = {
   getConfigPath: () => invoke<string>('get_config_path'),
   getOpenAIApiKey: () => invoke<string>('get_open_ai_api_key'),
   setOpenAIApiKey: (apiKey: string) => invoke<void>('set_open_ai_api_key', { apiKey }),
-  stageChanges: (repoPath: string, patch: string) =>
-    invoke<void>('stage_changes', { repoPath, patch }),
-  stageFiles: (repoPath: string, filePaths: string[]) =>
-    invoke<void>('stage_files', { repoPath, filePaths }),
+  /** Reset the index, then stage partially selected hunks and fully selected files. */
+  stageSelection: (repoPath: string, patch: string | null, filePaths: string[]) =>
+    invoke<void>('stage_selection', { repoPath, patch, filePaths }),
   commit: (repoPath: string, message: string) => invoke<void>('commit', { repoPath, message }),
   push: (repoPath: string) => invoke<void>('push', { repoPath }),
   createPrivateRepoAndPush: (repoPath: string) =>
@@ -90,7 +89,11 @@ export function onNavigateToSettings(callback: () => void): Unsubscribe {
   return subscribe<unknown>('navigate-to-settings', () => callback());
 }
 
-/** Deep link handled before the renderer was listening (cold start). */
+/**
+ * Take (and clear) the deep link the host parked for the renderer. Returns the
+ * target when it arrived before the renderer was listening (cold start or a
+ * recreated window), `null` otherwise.
+ */
 export function takePendingNavigation(): Promise<NavigateToRepoPayload | null> {
   return invoke<NavigateToRepoPayload | null>('take_pending_navigation');
 }
