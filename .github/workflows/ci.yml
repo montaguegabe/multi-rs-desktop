@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: multi-rs-desktop
+      - name: Check out multi-rs (multi-core path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: montaguegabe/multi-rs
+          token: ${{ secrets.MULTI_RS_READ_TOKEN }}
+          path: multi-rs
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: multi-rs-desktop/pnpm-lock.yaml
+      - name: Frontend
+        working-directory: multi-rs-desktop
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm build
+      - name: Rust
+        working-directory: multi-rs-desktop/src-tauri
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
