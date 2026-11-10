@@ -1,6 +1,6 @@
 # multi-rs-desktop
 
-Tauri 2 + React desktop app for multi workspaces. Private remake of the Electron `multi-desktop` repo, which is reference only and must never be pushed to from here.
+Tauri 2 + React desktop app for multi workspaces. Remake of the Electron `multi-desktop` repo, which is reference only and must never be pushed to from here.
 
 - `src-tauri/` is a thin command layer: project inspection comes from `multi_core::app_api` (path dependency on the sibling `multi-rs` checkout); git writes shell out to `git`. Do not add libgit2.
 - Keep `~/.multi/projects.json` and `~/.multi/settings.json` formats compatible with the `multi` CLI and the Electron app.

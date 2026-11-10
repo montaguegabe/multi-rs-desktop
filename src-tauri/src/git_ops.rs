@@ -126,7 +126,7 @@ fn is_stale_push_failure(failure: &GitFailure) -> bool {
 fn apply_patch(cwd: &Path, args: &[&str], patch: &str) -> Result<(), String> {
     let mut full: Vec<&str> = args.to_vec();
     full.push("-");
-    run_git_with_input(cwd, &full, patch)
+    run_git_with_input(cwd, &full, patch, DEFAULT_TIMEOUT)
         .map(|_| ())
         .map_err(|err| err.to_string())
 }

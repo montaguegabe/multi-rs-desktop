@@ -16,7 +16,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: montaguegabe/multi-rs
-          token: ${{ secrets.MULTI_RS_READ_TOKEN }}
           path: multi-rs
       - uses: dtolnay/rust-toolchain@stable
         with:
